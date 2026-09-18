@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Artify PRO — Google Drive OAuth Bridge</title>
+  <meta name="robots" content="noindex,nofollow">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    body{margin:0;background:#0b1020;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh;display:grid;place-items:center}
+    .card{width:min(560px,calc(100% - 32px));background:#111827;border:1px solid #273449;border-radius:20px;padding:28px;box-shadow:0 20px 60px #0008}
+    h1{font-size:20px;margin:0 0 10px}.muted{color:#9ca3af;font-size:13px;line-height:1.6}.status{margin-top:18px;padding:12px 14px;border-radius:12px;background:#0f172a;border:1px solid #24324a;font-size:13px}.ok{color:#86efac}.warn{color:#fcd34d}.err{color:#fca5a5}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Artify PRO — Google Drive Authorization</h1>
+    <div class="muted">This page is a top-level OAuth bridge for Gemini Canvas. It does not upload project data and does not require a Client Secret.</div>
+    <div id="status" class="status">Waiting for Artify…</div>
+  </div>
+<script>
+(() => {
+  'use strict';
+
+  const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+  // Gemini Canvas origins observed for this app end with scf.usercontent.goog.
+  // For tighter security, replace this matcher with the exact origin pattern you trust.
+  const ALLOWED_OPENER = /^https:\/\/(?:[^./]+\.)?scf\.usercontent\.goog$/i;
+  const statusEl = document.getElementById('status');
+  let openerWindow = null;
+  let openerOrigin = null;
+  let activeState = null;
+  let tokenClient = null;
+
+  const setStatus = (text, cls='') => {
+    statusEl.textContent = text;
+    statusEl.className = 'status ' + cls;
+  };
+
+  const post = (payload) => {
+    if (!openerWindow || !openerOrigin) return;
+    try { openerWindow.postMessage(payload, openerOrigin); } catch (e) {}
+  };
+
+  const fail = (state, error) => {
+    post({type:'ARTIFY_DRIVE_AUTH_ERROR', state, error:String(error || 'DRIVE_AUTH_FAILED')});
+    setStatus('Authorization failed. You can close this window.', 'err');
+  };
+
+  const beginAuth = ({clientId, scope, state}) => {
+    if (scope !== DRIVE_SCOPE) { fail(state, 'INVALID_SCOPE'); return; }
+    if (!clientId) { fail(state, 'DRIVE_CLIENT_MISSING'); return; }
+    if (!window.google?.accounts?.oauth2) {
+      setStatus('Google Identity Services is still loading…', 'warn');
+      setTimeout(() => beginAuth({clientId,scope,state}), 250);
+      return;
+    }
+
+    activeState = state;
+    try {
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: DRIVE_SCOPE,
+        callback: (response) => {
+          if (!response) return fail(activeState, 'DRIVE_TOKEN_MISSING');
+          if (response.error) {
+            // A consent prompt is normally shown by GIS when permission is needed.
+            // If GIS reports that interaction is required, retry once with explicit consent.
+            if (String(response.error) === 'interaction_required' || String(response.error) === 'consent_required') {
+              try { tokenClient.requestAccessToken({prompt:'consent'}); return; } catch (e) { return fail(activeState, e); }
+            }
+            return fail(activeState, response.error);
+          }
+          if (!response.access_token) return fail(activeState, 'DRIVE_TOKEN_MISSING');
+          post({type:'ARTIFY_DRIVE_TOKEN', state:activeState, access_token:String(response.access_token), expires_in:Number(response.expires_in || 3600)});
+          setStatus('Authorization completed. This window will close automatically.', 'ok');
+          setTimeout(() => window.close(), 250);
+        }
+      });
+      tokenClient.requestAccessToken({prompt:''});
+      setStatus('Waiting for Google permission…', 'warn');
+    } catch (e) {
+      fail(state, e);
+    }
+  };
+
+  window.addEventListener('message', (event) => {
+    if (!event.source || event.source !== window.opener) return;
+    if (!ALLOWED_OPENER.test(event.origin)) return;
+    const data = event.data || {};
+    if (data.type !== 'ARTIFY_DRIVE_AUTH_REQUEST') return;
+    openerWindow = event.source;
+    openerOrigin = event.origin;
+    beginAuth({clientId:String(data.clientId || ''), scope:String(data.scope || ''), state:String(data.state || '')});
+  });
+
+  if (!window.opener) {
+    setStatus('Open this page from Artify PRO. It is an OAuth bridge, not a standalone sign-in page.', 'warn');
+    return;
+  }
+
+  // Inform Artify that the popup is alive. The parent validates this event's origin/source
+  // before sending the actual OAuth request, so referrer privacy policies do not break the handshake.
+  try {
+    window.opener.postMessage({type:'ARTIFY_DRIVE_BRIDGE_READY'}, '*');
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>
