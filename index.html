@@ -3,171 +3,82 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Artify PRO — Google Drive OAuth Bridge</title>
+  <title>Artify PRO — Local Save Agent</title>
   <meta name="robots" content="noindex,nofollow">
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <style>
-    body{margin:0;background:#0b1020;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh;display:grid;place-items:center}
-    .card{width:min(560px,calc(100% - 32px));background:#111827;border:1px solid #273449;border-radius:20px;padding:28px;box-shadow:0 20px 60px #0008}
-    h1{font-size:20px;margin:0 0 10px}.muted{color:#9ca3af;font-size:13px;line-height:1.6}.status{margin-top:18px;padding:12px 14px;border-radius:12px;background:#0f172a;border:1px solid #24324a;font-size:13px}.ok{color:#86efac}.warn{color:#fcd34d}.err{color:#fca5a5}
+    body{margin:0;background:#0b1020;color:#e5e7eb;font:14px system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh;display:grid;place-items:center}
+    main{width:min(660px,calc(100% - 30px));background:#111827;border:1px solid #273449;border-radius:22px;padding:28px;box-shadow:0 20px 70px #0009;box-sizing:border-box}
+    h1{margin:0 0 8px;font-size:21px}.muted{color:#9ca3af;line-height:1.6;font-size:13px}.status{margin-top:18px;padding:14px;border-radius:14px;background:#0f172a;border:1px solid #26344b}.ok{color:#86efac}.warn{color:#fcd34d}.err{color:#fca5a5}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.row.one{grid-template-columns:1fr}.btn{border:0;border-radius:12px;padding:13px 14px;background:#4f46e5;color:#fff;font-weight:800;cursor:pointer}.btn.secondary{background:#1f2937;border:1px solid #374151}.btn.danger{background:#7f1d1d}.btn:disabled{opacity:.45;cursor:not-allowed}
+    .meta{margin-top:18px;padding:13px;border-radius:14px;background:#0b1220;border:1px solid #202c40;font-size:12px;color:#cbd5e1}.kv{display:flex;justify-content:space-between;gap:16px;padding:5px 0}.kv span:first-child{color:#94a3b8}.small{font-size:11px;color:#64748b;margin-top:14px}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>Artify PRO — Google Drive Authorization</h1>
-    <div class="muted">This page is a top-level OAuth bridge for Gemini Canvas. It does not upload project data and does not require a Client Secret.</div>
-    <div id="status" class="status">Waiting for Artify…</div>
+<main>
+  <h1>Artify PRO — Local Save Agent</h1>
+  <div class="muted" id="intro">This top-level page owns the selected device folder so Gemini Canvas can save safely without needing direct file-picker access inside its cross-origin frame.</div>
+  <div class="status warn" id="status">Checking saved folder…</div>
+  <div class="row">
+    <button class="btn" id="choose">Choose / Change Save Folder</button>
+    <button class="btn secondary" id="grant">Restore Write Access</button>
   </div>
+  <div class="row one">
+    <button class="btn secondary" id="forget">Forget Saved Folder Link</button>
+  </div>
+  <div class="meta" id="meta"></div>
+  <div class="small">Artify PRO stores only the directory handle on this static helper origin. Project files are written directly to the folder on your device. No Artify server or Google Drive is involved.</div>
+</main>
 <script>
-(() => {
-  'use strict';
-
-  const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
-  const ALLOWED_OPENER = /^https:\/\/(?:[^./]+\.)?scf\.usercontent\.goog$/i;
-  const statusEl = document.getElementById('status');
-  let openerWindow = null;
-  let openerOrigin = null;
-  let activeState = null;
-  let tokenClient = null;
-  let authStarted = false;
-  let returnPort = null;
-
-  const setStatus = (text, cls = '') => {
-    statusEl.textContent = text;
-    statusEl.className = 'status ' + cls;
-  };
-
-  const postToArtify = (payload) => {
-    // Preferred path: dedicated MessagePort. This avoids relying on the opener
-    // WindowProxy after cross-origin popup/browsing-context policy changes.
-    if (returnPort) {
-      try { returnPort.postMessage(payload); return true; } catch (e) {}
-    }
-    if (!openerWindow || !openerOrigin) return false;
-    try {
-      openerWindow.postMessage(payload, openerOrigin);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  };
-
-  const fail = (state, error) => {
-    const finalState = state || activeState || '';
-    postToArtify({
-      type: 'ARTIFY_DRIVE_AUTH_ERROR',
-      state: finalState,
-      error: String(error || 'DRIVE_AUTH_FAILED')
-    });
-    setStatus('Authorization failed. You can close this window.', 'err');
-  };
-
-  const waitForGoogleAndStart = (request) => {
-    if (window.google?.accounts?.oauth2) {
-      beginAuth(request);
-      return;
-    }
-    setStatus('Loading Google authorization…', 'warn');
-    setTimeout(() => waitForGoogleAndStart(request), 200);
-  };
-
-  const beginAuth = ({ clientId, scope, state }) => {
-    if (authStarted) return;
-    if (!state) return fail('', 'OAUTH_STATE_MISSING');
-    if (scope !== DRIVE_SCOPE) return fail(state, 'INVALID_SCOPE');
-    if (!clientId) return fail(state, 'DRIVE_CLIENT_MISSING');
-
-    activeState = state;
-    authStarted = true;
-
-    try {
-      tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: DRIVE_SCOPE,
-        callback: (response) => {
-          if (!response) return fail(activeState, 'DRIVE_TOKEN_MISSING');
-          if (response.error) {
-            const error = String(response.error);
-            if (error === 'interaction_required' || error === 'consent_required') {
-              try {
-                tokenClient.requestAccessToken({ prompt: 'consent' });
-                return;
-              } catch (retryError) {
-                return fail(activeState, retryError);
-              }
-            }
-            return fail(activeState, response.error_description || error);
-          }
-          if (!response.access_token) return fail(activeState, 'DRIVE_TOKEN_MISSING');
-
-          const payload = {
-            type: 'ARTIFY_DRIVE_TOKEN',
-            state: activeState,
-            access_token: String(response.access_token),
-            expires_in: Number(response.expires_in || 3600)
-          };
-
-          const sent = postToArtify(payload);
-          if (!sent) {
-            setStatus('Authorization completed, but Artify could not be reached.', 'err');
-            return;
-          }
-
-          setStatus('Authorization completed. This window will close automatically.', 'ok');
-          setTimeout(() => { try { window.close(); } catch (e) {} }, 500);
-        },
-        error_callback: (err) => {
-          const type = String(err?.type || 'unknown');
-          fail(activeState, 'GIS_' + type);
-        }
-      });
-
-      setStatus('Opening Google permission…', 'warn');
-      tokenClient.requestAccessToken({ prompt: '' });
-    } catch (error) {
-      authStarted = false;
-      fail(state, error);
-    }
-  };
-
-  window.addEventListener('message', (event) => {
-    if (!window.opener || event.source !== window.opener) return;
-    if (!ALLOWED_OPENER.test(event.origin)) return;
-
-    const data = event.data || {};
-    if (data.type !== 'ARTIFY_DRIVE_AUTH_REQUEST') return;
-
-    openerWindow = event.source;
-    openerOrigin = event.origin;
-    if (event.ports?.[0]) {
-      try {
-        returnPort = event.ports[0];
-        returnPort.start();
-      } catch (e) {}
-    }
-
-    waitForGoogleAndStart({
-      clientId: String(data.clientId || ''),
-      scope: String(data.scope || ''),
-      state: String(data.state || '')
-    });
-  });
-
-  if (!window.opener) {
-    setStatus('Open this page from Artify PRO. It is an OAuth bridge, not a standalone sign-in page.', 'warn');
-    return;
-  }
-
-  // Initial discovery handshake. The parent will reply with the authenticated
-  // request and a MessagePort for the token response.
-  try {
-    window.opener.postMessage({ type: 'ARTIFY_DRIVE_BRIDGE_READY' }, '*');
-    setStatus('Connected to Artify. Waiting for Google permission…', 'warn');
-  } catch (error) {
-    setStatus('Could not contact Artify.', 'err');
-  }
+(()=>{
+'use strict';
+const DB='artify-pro-local-save-agent-v1', STORE='state', KEY='directory';
+const AGENT_READY='ARTIFY_LOCAL_SAVE_AGENT_READY';
+const openerAllowed=/^https:\/\/(?:[^./]+\.)?scf\.usercontent\.goog$/i;
+const statusEl=document.getElementById('status'),metaEl=document.getElementById('meta'),chooseBtn=document.getElementById('choose'),grantBtn=document.getElementById('grant'),forgetBtn=document.getElementById('forget');
+let handle=null,openerWindow=null,openerOrigin=null;
+const db=()=>new Promise((res,rej)=>{const r=indexedDB.open(DB,1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains(STORE))r.result.createObjectStore(STORE);};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+async function getHandle(){try{const d=await db();const h=await new Promise((res,rej)=>{const q=d.transaction(STORE,'readonly').objectStore(STORE).get(KEY);q.onsuccess=()=>res(q.result||null);q.onerror=()=>rej(q.error)});d.close();return h}catch{return null}}
+async function putHandle(h){const d=await db();await new Promise((res,rej)=>{const t=d.transaction(STORE,'readwrite');t.objectStore(STORE).put(h,KEY);t.oncomplete=res;t.onerror=()=>rej(t.error)});d.close()}
+async function delHandle(){try{const d=await db();await new Promise((res,rej)=>{const t=d.transaction(STORE,'readwrite');t.objectStore(STORE).delete(KEY);t.oncomplete=res;t.onerror=()=>rej(t.error)});d.close()}catch{}}
+async function perm(){if(!handle)return'denied';try{return await handle.queryPermission({mode:'readwrite'})}catch{return'denied'}}
+function setStatus(text,cls='warn'){statusEl.textContent=text;statusEl.className='status '+cls;metaEl.innerHTML=`<div class="kv"><span>Folder</span><strong>${escapeHtml(handle?.name||'No folder')}</strong></div><div class="kv"><span>Permission</span><strong>${escapeHtml(handle?lastPerm:'denied')}</strong></div>`}
+function escapeHtml(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','\"':'&quot;'}[c]))}
+let lastPerm='denied';
+async function refresh(){handle=handle||await getHandle();lastPerm=await perm();if(handle&&lastPerm==='granted'){setStatus('Save folder connected and ready.','ok')}else if(handle&&lastPerm==='prompt'){setStatus('Save folder remembered. Click Restore Write Access to continue.','warn')}else if(handle){setStatus('A saved folder was found, but write permission is unavailable.','err')}else{setStatus('No save folder selected yet.','warn')}postStatus()}
+function postStatus(){if(!openerWindow||!openerOrigin)return;try{openerWindow.postMessage({type:'ARTIFY_LOCAL_SAVE_AGENT_STATUS',configured:!!handle,permission:lastPerm,folderName:handle?.name||''},openerOrigin)}catch{}}
+function ready(){if(!window.opener)return;try{window.opener.postMessage({type:AGENT_READY},'*')}catch{}}
+async function chooseFolder(){
+  try{
+    const h=await window.showDirectoryPicker({id:'artify-pro-save',mode:'readwrite'});
+    handle=h; await putHandle(h); lastPerm=await perm(); setStatus('Save folder selected and ready. Keep this window open while Artify is working.','ok'); postStatus(); if(openerWindow)try{openerWindow.postMessage({type:'ARTIFY_LOCAL_FOLDER_READY',name:h.name||'Artify Project'},openerOrigin||'*')}catch{}
+  }catch(e){if(e?.name==='AbortError'){setStatus('Folder selection canceled.','warn')}else{setStatus('Could not access that folder.','err')}}
+}
+async function restoreAccess(){if(!handle)return chooseFolder();try{lastPerm=await handle.requestPermission({mode:'readwrite'});await putHandle(handle);await refresh()}catch{setStatus('Write permission could not be restored.','err')}}
+async function ensureReady(){if(!handle)throw new Error('LOCAL_FOLDER_NOT_SELECTED');lastPerm=await perm();if(lastPerm!=='granted')throw new Error('LOCAL_FOLDER_PERMISSION')}
+async function ensureDir(path){const seg=String(path).split('/').filter(Boolean);let dir=handle;for(const s of seg){dir=await dir.getDirectoryHandle(s,{create:true})}return dir}
+function split(path){const a=String(path).split('/').filter(Boolean),name=a.pop();if(!name)throw new Error('LOCAL_PATH_INVALID');return{parts:a,name}}
+async function writeBuffer(path,buffer,mime){await ensureReady();const {parts,name}=split(path);let dir=handle;for(const p of parts)dir=await dir.getDirectoryHandle(p,{create:true});const fh=await dir.getFileHandle(name,{create:true});const w=await fh.createWritable();try{await w.write(new Blob([buffer],{type:mime||'application/octet-stream'}));await w.close()}catch(e){try{await w.abort()}catch{};throw e}}
+async function readFile(path){await ensureReady();const {parts,name}=split(path);let dir=handle;for(const p of parts)dir=await dir.getDirectoryHandle(p,{create:false});const fh=await dir.getFileHandle(name,{create:false});return fh.getFile()}
+function reply(id,payload,transfer=[]){if(!openerWindow||!openerOrigin)return;try{openerWindow.postMessage({type:'ARTIFY_LOCAL_SAVE_AGENT_RESULT',requestId:id,...payload},openerOrigin,transfer)}catch{}}
+window.addEventListener('message',async(event)=>{
+  if(event.source!==window.opener)return;
+  if(!openerWindow){if(!openerAllowed.test(event.origin))return;openerWindow=event.source;openerOrigin=event.origin}
+  if(event.source!==openerWindow||event.origin!==openerOrigin)return;
+  const d=event.data||{};const id=String(d.requestId||'');
+  try{
+    if(d.type==='ARTIFY_LOCAL_SAVE_AGENT_STATUS'){await refresh();if(id)reply(id,{ok:true,result:{...window.__status}});return}
+    if(d.type==='ARTIFY_LOCAL_REQUEST_PERMISSION'){if(!handle)throw new Error('LOCAL_FOLDER_NOT_SELECTED');lastPerm=await handle.requestPermission({mode:'readwrite'});await refresh();reply(id,{ok:true,result:lastPerm});return}
+    if(d.type==='ARTIFY_LOCAL_FORGET'){handle=null;await delHandle();lastPerm='denied';setStatus('Saved folder link forgotten. Your files were not deleted.','warn');postStatus();reply(id,{ok:true,result:true});return}
+    if(d.type==='ARTIFY_LOCAL_WRITE_TEXT'){await ensureReady();const blob=new Blob([String(d.text||'')],{type:'application/json;charset=utf-8'});if(blob.size>25*1024*1024)throw new Error('LOCAL_STATE_TOO_LARGE');await writeBuffer(String(d.path||''),await blob.arrayBuffer(),blob.type);reply(id,{ok:true,result:true});return}
+    if(d.type==='ARTIFY_LOCAL_WRITE_BLOB'){await writeBuffer(String(d.path||''),d.buffer,d.mime);reply(id,{ok:true,result:true});return}
+    if(d.type==='ARTIFY_LOCAL_READ_TEXT'){const f=await readFile(String(d.path||''));reply(id,{ok:true,result:await f.text()});return}
+    if(d.type==='ARTIFY_LOCAL_READ_BLOB'){const f=await readFile(String(d.path||''));const buffer=await f.arrayBuffer();reply(id,{ok:true,binary:true,mime:f.type||'application/octet-stream',buffer},[buffer]);return}
+  }catch(e){if(id)reply(id,{ok:false,error:String(e?.message||e||'LOCAL_AGENT_ERROR')})}
+});
+Object.defineProperty(window,'__status',{value:{get configured(){return !!handle},get permission(){return lastPerm},get folderName(){return handle?.name||''}}});
+chooseBtn.onclick=chooseFolder;grantBtn.onclick=restoreAccess;forgetBtn.onclick=async()=>{if(confirm('Forget the saved folder link? Files on your device will not be deleted.')){handle=null;await delHandle();lastPerm='denied';await refresh()}};
+(async()=>{await refresh();ready();})();
 })();
 </script>
-
 </body>
 </html>
